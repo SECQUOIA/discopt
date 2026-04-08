@@ -13,6 +13,27 @@ discopt is a hybrid Mixed-Integer Nonlinear Programming (MINLP) solver combining
 cd discopt_benchmarks && pip install -e ".[dev]"
 ```
 
+### Installing IPOPT / cyipopt for NLP solving
+
+The NLP solvers (`nlp_solver="ipopt"`) require [cyipopt](https://cyipopt.readthedocs.io/), which needs the IPOPT shared library. Install IPOPT via conda first, then build cyipopt against it:
+
+```bash
+# Install IPOPT (conda-forge provides the shared library)
+conda install -c conda-forge ipopt
+
+# Build cyipopt against the conda IPOPT and install into the uv-managed venv
+PKG_CONFIG_PATH=$CONDA_PREFIX/lib/pkgconfig uv pip install --no-binary cyipopt cyipopt
+
+# Patch the .so to embed the conda library RPATH (so it works without LD_LIBRARY_PATH)
+.venv/bin/patchelf --set-rpath $CONDA_PREFIX/lib \
+    .venv/lib/python*/site-packages/ipopt_wrapper.cpython-*.so
+
+# Verify
+.venv/bin/python -c "import cyipopt; print(cyipopt.__version__)"
+```
+
+The `patchelf` binary is provided by `uv pip install patchelf` (PyPI package). Without RPATH patching, you must set `LD_LIBRARY_PATH=$CONDA_PREFIX/lib` before running Python.
+
 ### Tests
 ```bash
 pytest python/tests/ -v                                  # discopt tests
