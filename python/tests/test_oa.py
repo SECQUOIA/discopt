@@ -303,6 +303,9 @@ class TestEqualityRelaxation:
 
         result = _solve_oa(m, equality_relaxation=True)
         assert result.status in ("optimal", "feasible")
+        assert result.bound is None
+        assert result.gap is None
+        assert result.gap_certified is False
 
 
 # ── Regression vs B&B ────────────────────────────────────────

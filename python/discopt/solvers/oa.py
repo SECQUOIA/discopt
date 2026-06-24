@@ -342,6 +342,9 @@ def _equality_relaxation_sigma(
     """Return the dual-oriented sign for a relaxed equality row."""
     if multipliers is None or row_index >= len(multipliers):
         return 1.0
+    # Both NLP backends expose Ipopt-compatible ``mult_g`` values unchanged;
+    # OA then adjusts only for the user's objective sense because the evaluator
+    # internally converts maximization to minimization.
     dual = float(multipliers[row_index])
     sign_adjust = 1.0 if objective_sense == ObjectiveSense.MAXIMIZE else -1.0
     val = sign_adjust * dual
@@ -821,9 +824,7 @@ def solve_oa(
     t_start = time.perf_counter()
 
     if kwargs:
-        raise NotImplementedError(
-            "OA/MIP-NLP options not implemented by this backend: " + ", ".join(sorted(kwargs))
-        )
+        raise ValueError("Unsupported OA/MIP-NLP option(s): " + ", ".join(sorted(kwargs)))
     if heuristic_nonconvex:
         equality_relaxation = True
         add_slack = True
@@ -845,7 +846,13 @@ def solve_oa(
         model._objective.sense if model._objective is not None else ObjectiveSense.MINIMIZE
     )
     constraint_cut_mask = None if heuristic_nonconvex else decomp.oa_constraint_mask
-    public_bound_valid = decomp.master_bound_valid and not add_slack
+    uses_relaxed_equality_cuts = (
+        bool(decomp.int_indices)
+        and equality_relaxation
+        and any(sense == "==" for sense in decomp.constraint_senses[:n_cons])
+    )
+    uses_uncertified_relaxation = add_slack or uses_relaxed_equality_cuts
+    public_bound_valid = decomp.master_bound_valid and not uses_uncertified_relaxation
     if constraint_cut_mask is not None and not all(constraint_cut_mask):
         logger.warning(
             "OA: generating OA cuts only for %d of %d constraints classified convex",
@@ -856,6 +863,11 @@ def solve_oa(
         logger.warning(
             "OA: heuristic_nonconvex=True uses non-certified tangent cuts and "
             "augmented penalty slacks; returned bounds/gaps will be uncertified"
+        )
+    elif uses_relaxed_equality_cuts:
+        logger.warning(
+            "OA: equality_relaxation=True relaxes equality OA cuts; returned "
+            "bounds/gaps will be uncertified"
         )
     if not decomp.obj_is_linear and not decomp.oa_objective_is_convex:
         logger.warning(
@@ -869,13 +881,15 @@ def solve_oa(
         wall_time = time.perf_counter() - t_start
         if nlp_relax.x is not None and nlp_relax.objective is not None:
             return SolveResult(
-                status="feasible" if add_slack else "optimal",
+                status="feasible" if uses_uncertified_relaxation else "optimal",
                 objective=_obj_sign * nlp_relax.objective,
-                bound=(_obj_sign * nlp_relax.objective if not add_slack else None),
-                gap=0.0 if not add_slack else None,
+                bound=(
+                    _obj_sign * nlp_relax.objective if not uses_uncertified_relaxation else None
+                ),
+                gap=0.0 if not uses_uncertified_relaxation else None,
                 x=_build_x_dict(nlp_relax.x, model),
                 wall_time=wall_time,
-                gap_certified=not add_slack,
+                gap_certified=not uses_uncertified_relaxation,
             )
         return SolveResult(
             status="infeasible",
@@ -1159,7 +1173,11 @@ def solve_oa(
     reported_gap = gap if bound is not None and UB < 1e19 else None
 
     if incumbent is not None and incumbent_obj is not None:
-        status = "feasible" if add_slack else ("optimal" if gap <= gap_tolerance else "feasible")
+        status = (
+            "feasible"
+            if uses_uncertified_relaxation
+            else ("optimal" if gap <= gap_tolerance else "feasible")
+        )
         return SolveResult(
             status=status,
             objective=_obj_sign * incumbent_obj,
@@ -1167,15 +1185,15 @@ def solve_oa(
             gap=reported_gap,
             x=_build_x_dict(incumbent, model),
             wall_time=wall_time,
-            gap_certified=not add_slack,
+            gap_certified=not uses_uncertified_relaxation,
         )
 
     return SolveResult(
-        status="iteration_limit" if add_slack else "infeasible",
+        status="iteration_limit" if uses_uncertified_relaxation else "infeasible",
         objective=None,
         bound=(_obj_sign * bound if bound is not None else None),
         gap=None,
         x={},
         wall_time=wall_time,
-        gap_certified=not add_slack,
+        gap_certified=not uses_uncertified_relaxation,
     )

@@ -189,6 +189,65 @@ def test_equality_relaxation_orientation_uses_objective_sense():
     assert _equality_relaxation_sigma(2, np.array([2.0]), ObjectiveSense.MINIMIZE) == 1.0
 
 
+def test_equality_relaxation_orientation_flips_master_cut_row():
+    from discopt.solvers.oa import _add_oa_cuts
+
+    class FakeEvaluator:
+        def evaluate_constraints(self, x):
+            return np.array([4.0])
+
+        def evaluate_jacobian(self, x):
+            return np.array([[2.0, -1.0]])
+
+    x_star = np.array([1.0, 3.0])
+    rows: list[np.ndarray] = []
+    rhs: list[float] = []
+    slack_flags: list[bool] = []
+
+    _add_oa_cuts(
+        FakeEvaluator(),
+        x_star,
+        n_vars=2,
+        n_cons=1,
+        constraint_senses=["=="],
+        oa_A_rows=rows,
+        oa_b_rows=rhs,
+        obj_is_linear=True,
+        constraint_convex_mask=[True],
+        objective_is_convex=True,
+        equality_relaxation=True,
+        add_slack=True,
+        oa_slack_flags=slack_flags,
+        multipliers=np.array([2.0]),
+        objective_sense=ObjectiveSense.MINIMIZE,
+    )
+
+    np.testing.assert_allclose(rows, np.array([[-2.0, 1.0]]))
+    np.testing.assert_allclose(rhs, np.array([5.0]))
+    assert slack_flags == [True]
+
+    rows = []
+    rhs = []
+    _add_oa_cuts(
+        FakeEvaluator(),
+        x_star,
+        n_vars=2,
+        n_cons=1,
+        constraint_senses=["=="],
+        oa_A_rows=rows,
+        oa_b_rows=rhs,
+        obj_is_linear=True,
+        constraint_convex_mask=[True],
+        objective_is_convex=True,
+        equality_relaxation=True,
+        multipliers=np.array([2.0]),
+        objective_sense=ObjectiveSense.MAXIMIZE,
+    )
+
+    np.testing.assert_allclose(rows, np.array([[2.0, -1.0]]))
+    np.testing.assert_allclose(rhs, np.array([-5.0]))
+
+
 def test_heuristic_nonconvex_oa_result_is_uncertified():
     from discopt.solvers.mip_nlp import solve_mip_nlp
 
@@ -214,3 +273,10 @@ def test_mip_nlp_rejects_unsupported_oa_options():
             method="oa",
             mip_nlp_options={"solution_pool": True},
         )
+
+
+def test_solve_oa_rejects_unsupported_options_with_value_error():
+    from discopt.solvers.oa import solve_oa
+
+    with pytest.raises(ValueError, match="Unsupported OA/MIP-NLP option"):
+        solve_oa(_binary_model("unsupported_direct_oa_option"), solution_pool=True)
