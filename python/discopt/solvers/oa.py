@@ -48,6 +48,17 @@ class OAConfig:
     log_iterations: bool = True
 
 
+@dataclass
+class _OANLPResult:
+    """Internal NLP result used by OA so multipliers survive solver calls."""
+
+    x: Optional[np.ndarray] = None
+    objective: Optional[float] = None
+    multipliers: Optional[np.ndarray] = None
+    primal_feasible: bool = False
+    status: object = None
+
+
 # ── Problem Decomposition ─────────────────────────────────────
 
 
@@ -206,8 +217,8 @@ def _is_primal_feasible(evaluator, x, tol: float = 1e-4) -> bool:
         return False
 
 
-def _solve_nlp(evaluator, lb, ub, nlp_solver: str, max_iter: int = 200):
-    """Solve an NLP with given bounds. Returns (x, obj) or (None, None)."""
+def _solve_nlp(evaluator, lb, ub, nlp_solver: str, max_iter: int = 200) -> _OANLPResult:
+    """Solve an NLP with given bounds."""
     lb_clip = np.clip(lb, -1e8, 1e8)
     ub_clip = np.clip(ub, -1e8, 1e8)
     x0 = 0.5 * (lb_clip + ub_clip)
@@ -223,17 +234,29 @@ def _solve_nlp(evaluator, lb, ub, nlp_solver: str, max_iter: int = 200):
         from discopt.solvers import SolveStatus
 
         if result.status == SolveStatus.OPTIMAL:
-            return result.x, float(evaluator.evaluate_objective(result.x))
+            return _OANLPResult(
+                x=result.x,
+                objective=float(evaluator.evaluate_objective(result.x)),
+                multipliers=result.multipliers,
+                primal_feasible=True,
+                status=result.status,
+            )
 
         # Accept iteration-limited results if the solution is primal feasible.
         # The IPM may not certify dual convergence (code 4: stalled) yet still
         # find a valid primal point, which is sufficient for OA linearization cuts.
         if result.status == SolveStatus.ITERATION_LIMIT and result.x is not None:
             if _is_primal_feasible(evaluator, result.x):
-                return result.x, float(evaluator.evaluate_objective(result.x))
+                return _OANLPResult(
+                    x=result.x,
+                    objective=float(evaluator.evaluate_objective(result.x)),
+                    multipliers=result.multipliers,
+                    primal_feasible=True,
+                    status=result.status,
+                )
     except Exception:
         pass
-    return None, None
+    return _OANLPResult()
 
 
 def _solve_nlp_relaxation(evaluator, lb, ub, nlp_solver: str):
@@ -296,6 +319,35 @@ def _solve_feasibility_subproblem(evaluator, lb, ub, int_indices, x_master, nlp_
 # ── Cut Generation ────────────────────────────────────────────
 
 
+def _append_master_cut(
+    oa_A_rows: list[np.ndarray],
+    oa_b_rows: list[float],
+    coeffs: np.ndarray,
+    rhs: float,
+    oa_slack_flags: Optional[list[bool]] = None,
+    uses_slack: bool = False,
+) -> None:
+    """Append one <= master cut and its optional penalty-slack flag."""
+    oa_A_rows.append(np.asarray(coeffs, dtype=np.float64).copy())
+    oa_b_rows.append(float(rhs))
+    if oa_slack_flags is not None:
+        oa_slack_flags.append(bool(uses_slack))
+
+
+def _equality_relaxation_sigma(
+    row_index: int,
+    multipliers: Optional[np.ndarray],
+    objective_sense: ObjectiveSense,
+) -> float:
+    """Return the dual-oriented sign for a relaxed equality row."""
+    if multipliers is None or row_index >= len(multipliers):
+        return 1.0
+    dual = float(multipliers[row_index])
+    sign_adjust = 1.0 if objective_sense == ObjectiveSense.MAXIMIZE else -1.0
+    val = sign_adjust * dual
+    return 1.0 if val >= 0.0 else -1.0
+
+
 def _add_oa_cuts(
     evaluator,
     x_star,
@@ -308,6 +360,10 @@ def _add_oa_cuts(
     constraint_convex_mask,
     objective_is_convex,
     equality_relaxation=False,
+    add_slack: bool = False,
+    oa_slack_flags: Optional[list[bool]] = None,
+    multipliers: Optional[np.ndarray] = None,
+    objective_sense: ObjectiveSense = ObjectiveSense.MINIMIZE,
 ):
     """Generate OA cuts at x_star and append to cut lists.
 
@@ -315,19 +371,20 @@ def _add_oa_cuts(
     Objective cuts (when nonlinear) have length n_vars+1, with the last
     element being the -eta epigraph coefficient.
     """
-    from discopt._jax.cutting_planes import (
-        generate_oa_cuts_from_evaluator,
-        generate_objective_oa_cut,
-    )
+    from discopt._jax.cutting_planes import generate_oa_cut, generate_objective_oa_cut
 
     if n_cons > 0:
-        cuts = generate_oa_cuts_from_evaluator(
-            evaluator,
-            x_star,
-            constraint_senses=constraint_senses,
-            convex_mask=constraint_convex_mask,
-        )
-        for cut in cuts:
+        cons_vals = evaluator.evaluate_constraints(x_star)
+        jac = evaluator.evaluate_jacobian(x_star)
+        for row_index in range(n_cons):
+            if constraint_convex_mask is not None and not constraint_convex_mask[row_index]:
+                continue
+            cut = generate_oa_cut(
+                jac[row_index, :],
+                float(cons_vals[row_index]),
+                x_star,
+                sense=constraint_senses[row_index],
+            )
             coeffs = cut.coeffs.copy()
             # Filter degenerate cuts
             if np.linalg.norm(coeffs) < 1e-12:
@@ -335,27 +392,69 @@ def _add_oa_cuts(
 
             sense = cut.sense
             if equality_relaxation and sense == "==":
-                sense = "<="
+                sigma = _equality_relaxation_sigma(row_index, multipliers, objective_sense)
+                if sigma >= 0.0:
+                    _append_master_cut(
+                        oa_A_rows,
+                        oa_b_rows,
+                        coeffs,
+                        cut.rhs,
+                        oa_slack_flags,
+                        uses_slack=add_slack,
+                    )
+                else:
+                    _append_master_cut(
+                        oa_A_rows,
+                        oa_b_rows,
+                        -coeffs,
+                        -cut.rhs,
+                        oa_slack_flags,
+                        uses_slack=add_slack,
+                    )
+                continue
 
             if sense == "<=":
-                oa_A_rows.append(coeffs)
-                oa_b_rows.append(cut.rhs)
+                _append_master_cut(
+                    oa_A_rows,
+                    oa_b_rows,
+                    coeffs,
+                    cut.rhs,
+                    oa_slack_flags,
+                    uses_slack=add_slack,
+                )
             elif sense == ">=":
-                oa_A_rows.append(-coeffs)
-                oa_b_rows.append(-cut.rhs)
+                _append_master_cut(
+                    oa_A_rows,
+                    oa_b_rows,
+                    -coeffs,
+                    -cut.rhs,
+                    oa_slack_flags,
+                    uses_slack=add_slack,
+                )
             elif sense == "==":
                 # Equality: add both <= and >= cuts
-                oa_A_rows.append(coeffs)
-                oa_b_rows.append(cut.rhs)
-                oa_A_rows.append(-coeffs)
-                oa_b_rows.append(-cut.rhs)
+                _append_master_cut(
+                    oa_A_rows,
+                    oa_b_rows,
+                    coeffs,
+                    cut.rhs,
+                    oa_slack_flags,
+                    uses_slack=add_slack,
+                )
+                _append_master_cut(
+                    oa_A_rows,
+                    oa_b_rows,
+                    -coeffs,
+                    -cut.rhs,
+                    oa_slack_flags,
+                    uses_slack=add_slack,
+                )
 
     # Objective OA cut (only if nonlinear): grad^T x - eta <= rhs
     if not obj_is_linear and objective_is_convex:
         n_master = n_vars + 1
         obj_cut = generate_objective_oa_cut(evaluator, x_star, n_master, z_index=n_vars)
-        oa_A_rows.append(obj_cut.coeffs.copy())
-        oa_b_rows.append(obj_cut.rhs)
+        _append_master_cut(oa_A_rows, oa_b_rows, obj_cut.coeffs, obj_cut.rhs, oa_slack_flags)
 
 
 def _add_ecp_cuts(
@@ -369,6 +468,8 @@ def _add_ecp_cuts(
     constraint_convex_mask,
     objective_is_convex,
     equality_relaxation=False,
+    add_slack: bool = False,
+    oa_slack_flags: Optional[list[bool]] = None,
 ):
     """Generate ECP cuts: OA cuts only for violated constraints at x_master."""
     from discopt._jax.cutting_planes import (
@@ -394,31 +495,54 @@ def _add_ecp_cuts(
                 sense = "<="
 
             if sense == "<=":
-                oa_A_rows.append(coeffs)
-                oa_b_rows.append(cut.rhs)
+                _append_master_cut(
+                    oa_A_rows,
+                    oa_b_rows,
+                    coeffs,
+                    cut.rhs,
+                    oa_slack_flags,
+                    uses_slack=add_slack,
+                )
                 n_added += 1
             elif sense == ">=":
-                oa_A_rows.append(-coeffs)
-                oa_b_rows.append(-cut.rhs)
+                _append_master_cut(
+                    oa_A_rows,
+                    oa_b_rows,
+                    -coeffs,
+                    -cut.rhs,
+                    oa_slack_flags,
+                    uses_slack=add_slack,
+                )
                 n_added += 1
             elif sense == "==":
-                oa_A_rows.append(coeffs)
-                oa_b_rows.append(cut.rhs)
-                oa_A_rows.append(-coeffs)
-                oa_b_rows.append(-cut.rhs)
+                _append_master_cut(
+                    oa_A_rows,
+                    oa_b_rows,
+                    coeffs,
+                    cut.rhs,
+                    oa_slack_flags,
+                    uses_slack=add_slack,
+                )
+                _append_master_cut(
+                    oa_A_rows,
+                    oa_b_rows,
+                    -coeffs,
+                    -cut.rhs,
+                    oa_slack_flags,
+                    uses_slack=add_slack,
+                )
                 n_added += 2
 
     if not obj_is_linear and objective_is_convex:
         n_master = n_vars + 1
         obj_cut = generate_objective_oa_cut(evaluator, x_master, n_master, z_index=n_vars)
-        oa_A_rows.append(obj_cut.coeffs.copy())
-        oa_b_rows.append(obj_cut.rhs)
+        _append_master_cut(oa_A_rows, oa_b_rows, obj_cut.coeffs, obj_cut.rhs, oa_slack_flags)
         n_added += 1
 
     return n_added
 
 
-def _add_no_good_cut(x_master, int_indices, oa_A_rows, oa_b_rows, n_vars):
+def _add_no_good_cut(x_master, int_indices, oa_A_rows, oa_b_rows, n_vars, oa_slack_flags=None):
     """Add an integer-exclusion (no-good) cut.
 
     sum_{i: y_i*=1} (1-y_i) + sum_{i: y_i*=0} y_i >= 1
@@ -434,8 +558,7 @@ def _add_no_good_cut(x_master, int_indices, oa_A_rows, oa_b_rows, n_vars):
             count_ones += 1
         else:
             coeffs[idx] = -1.0
-    oa_A_rows.append(coeffs)
-    oa_b_rows.append(float(count_ones - 1))
+    _append_master_cut(oa_A_rows, oa_b_rows, coeffs, float(count_ones - 1), oa_slack_flags)
 
 
 def _add_feasibility_cuts(
@@ -446,6 +569,7 @@ def _add_feasibility_cuts(
     oa_A_rows,
     oa_b_rows,
     constraint_convex_mask,
+    oa_slack_flags: Optional[list[bool]] = None,
 ):
     """Add gradient-based feasibility cuts (Fletcher-Leyffer 1994).
 
@@ -468,11 +592,9 @@ def _add_feasibility_cuts(
         if np.linalg.norm(coeffs) < 1e-12:
             continue
         if cut.sense == "<=":
-            oa_A_rows.append(coeffs)
-            oa_b_rows.append(cut.rhs)
+            _append_master_cut(oa_A_rows, oa_b_rows, coeffs, cut.rhs, oa_slack_flags)
         elif cut.sense == ">=":
-            oa_A_rows.append(-coeffs)
-            oa_b_rows.append(-cut.rhs)
+            _append_master_cut(oa_A_rows, oa_b_rows, -coeffs, -cut.rhs, oa_slack_flags)
 
 
 # ── MILP Master Problem ──────────────────────────────────────
@@ -493,6 +615,9 @@ def _solve_master_milp(
     objective_bound_valid,
     time_limit,
     gap_tolerance,
+    oa_slack_flags: Optional[list[bool]] = None,
+    oa_penalty_factor: float = 1000.0,
+    max_slack: float = 1000.0,
 ):
     """Build and solve the master MILP."""
     try:
@@ -507,18 +632,39 @@ def _solve_master_milp(
         ) from e
 
     use_objective_epigraph = (not obj_is_linear) and objective_bound_valid
-    n_master = n_vars
+    n_base = n_vars
     if use_objective_epigraph:
-        n_master += 1  # epigraph variable eta
+        n_base += 1  # epigraph variable eta
+
+    if oa_slack_flags is None:
+        oa_slack_flags = [False] * len(oa_A_rows)
+    if len(oa_slack_flags) != len(oa_A_rows):
+        raise ValueError("oa_slack_flags must align with oa_A_rows")
+    slack_indices: dict[int, int] = {}
+    n_master = n_base
+    for i, uses_slack in enumerate(oa_slack_flags):
+        if uses_slack:
+            slack_indices[i] = n_master
+            n_master += 1
+
+    def _extend_row(row, base_len: int = n_base) -> np.ndarray:
+        row_arr = np.asarray(row, dtype=np.float64)
+        if len(row_arr) < base_len:
+            row_arr = np.pad(row_arr, (0, base_len - len(row_arr)))
+        elif len(row_arr) > base_len:
+            raise ValueError(
+                f"Master cut row has length {len(row_arr)} but base master has length {base_len}"
+            )
+        if n_master > base_len:
+            row_arr = np.pad(row_arr, (0, n_master - base_len))
+        return row_arr
 
     # Build A_ub, b_ub from linear <= constraints + OA cuts
     A_ub_rows = []
     b_ub_vals = []
 
     for i, sense in enumerate(linear_senses):
-        row = linear_A_rows[i]
-        if use_objective_epigraph:
-            row = np.append(row, 0.0)
+        row = _extend_row(linear_A_rows[i])
         if sense == "<=":
             A_ub_rows.append(row)
             b_ub_vals.append(linear_b_rows[i])
@@ -529,9 +675,9 @@ def _solve_master_milp(
     # OA cuts (all in <= form already)
     # Constraint cuts have length n_vars; objective cuts have length n_master
     for i in range(len(oa_A_rows)):
-        row = oa_A_rows[i]
-        if use_objective_epigraph and len(row) == n_vars:
-            row = np.append(row, 0.0)  # extend constraint cuts with 0 for eta
+        row = _extend_row(oa_A_rows[i])
+        if i in slack_indices:
+            row[slack_indices[i]] = -1.0
         A_ub_rows.append(row)
         b_ub_vals.append(oa_b_rows[i])
 
@@ -540,9 +686,7 @@ def _solve_master_milp(
     b_eq_vals = []
     for i, sense in enumerate(linear_senses):
         if sense == "==":
-            row = linear_A_rows[i]
-            if use_objective_epigraph:
-                row = np.append(row, 0.0)
+            row = _extend_row(linear_A_rows[i])
             A_eq_rows.append(row)
             b_eq_vals.append(linear_b_rows[i])
 
@@ -554,17 +698,22 @@ def _solve_master_milp(
     # Objective
     if obj_is_linear:
         c_vec, _off = obj_coeffs
-        c = c_vec.copy()
+        c = np.zeros(n_master)
+        c[:n_vars] = c_vec.copy()
     elif use_objective_epigraph:
         c = np.zeros(n_master)
-        c[-1] = 1.0  # minimize eta
+        c[n_vars] = 1.0  # minimize eta
     else:
         c = np.zeros(n_master)
+    for slack_idx in slack_indices.values():
+        c[slack_idx] = float(oa_penalty_factor)
 
     # Bounds
     bounds_list = list(zip(lb.tolist(), ub.tolist()))
     if use_objective_epigraph:
         bounds_list.append((-1e20, 1e20))  # eta unbounded
+    for _ in slack_indices:
+        bounds_list.append((0.0, float(max_slack)))
 
     # Integrality
     int_vec = np.zeros(n_master, dtype=np.int32)
@@ -618,6 +767,10 @@ def solve_oa(
     equality_relaxation: bool = False,
     ecp_mode: bool = False,
     feasibility_cuts: bool = True,
+    add_slack: bool = False,
+    oa_penalty_factor: float = 1000.0,
+    max_slack: float = 1000.0,
+    heuristic_nonconvex: bool = False,
     **kwargs,
 ) -> SolveResult:
     """Solve a MINLP via Outer Approximation.
@@ -649,12 +802,31 @@ def solve_oa(
     feasibility_cuts : bool
         Use gradient-based feasibility cuts (Fletcher & Leyffer 1994)
         when the NLP subproblem is infeasible. Stronger than no-good cuts.
+    add_slack : bool
+        Add bounded nonnegative slack variables to OA/ECP cuts and penalize
+        them in the master objective. Runs with slacks do not report certified
+        public bounds or gaps.
+    oa_penalty_factor : float
+        Objective penalty coefficient for each OA/ECP slack variable.
+    max_slack : float
+        Upper bound for each OA/ECP slack variable.
+    heuristic_nonconvex : bool
+        Use equality relaxation and penalty slacks as a heuristic nonconvex OA
+        mode. Results are incumbent-only and uncertified.
 
     Returns
     -------
     SolveResult
     """
     t_start = time.perf_counter()
+
+    if kwargs:
+        raise NotImplementedError(
+            "OA/MIP-NLP options not implemented by this backend: " + ", ".join(sorted(kwargs))
+        )
+    if heuristic_nonconvex:
+        equality_relaxation = True
+        add_slack = True
 
     # 1. Decompose model
     decomp = _decompose_model(model)
@@ -669,11 +841,21 @@ def solve_oa(
         if (model._objective is not None and model._objective.sense == ObjectiveSense.MAXIMIZE)
         else 1.0
     )
-    if decomp.oa_constraint_mask is not None and not all(decomp.oa_constraint_mask):
+    objective_sense = (
+        model._objective.sense if model._objective is not None else ObjectiveSense.MINIMIZE
+    )
+    constraint_cut_mask = None if heuristic_nonconvex else decomp.oa_constraint_mask
+    public_bound_valid = decomp.master_bound_valid and not add_slack
+    if constraint_cut_mask is not None and not all(constraint_cut_mask):
         logger.warning(
             "OA: generating OA cuts only for %d of %d constraints classified convex",
-            sum(1 for is_convex in decomp.oa_constraint_mask if is_convex),
-            len(decomp.oa_constraint_mask),
+            sum(1 for is_convex in constraint_cut_mask if is_convex),
+            len(constraint_cut_mask),
+        )
+    if heuristic_nonconvex:
+        logger.warning(
+            "OA: heuristic_nonconvex=True uses non-certified tangent cuts and "
+            "augmented penalty slacks; returned bounds/gaps will be uncertified"
         )
     if not decomp.obj_is_linear and not decomp.oa_objective_is_convex:
         logger.warning(
@@ -683,16 +865,17 @@ def solve_oa(
 
     # If no integer variables, just solve the NLP directly
     if len(decomp.int_indices) == 0:
-        x_sol, obj = _solve_nlp_relaxation(evaluator, decomp.lb, decomp.ub, nlp_solver)
+        nlp_relax = _solve_nlp_relaxation(evaluator, decomp.lb, decomp.ub, nlp_solver)
         wall_time = time.perf_counter() - t_start
-        if x_sol is not None:
+        if nlp_relax.x is not None and nlp_relax.objective is not None:
             return SolveResult(
-                status="optimal",
-                objective=_obj_sign * obj,
-                bound=_obj_sign * obj,
-                gap=0.0,
-                x=_build_x_dict(x_sol, model),
+                status="feasible" if add_slack else "optimal",
+                objective=_obj_sign * nlp_relax.objective,
+                bound=(_obj_sign * nlp_relax.objective if not add_slack else None),
+                gap=0.0 if not add_slack else None,
+                x=_build_x_dict(nlp_relax.x, model),
                 wall_time=wall_time,
+                gap_certified=not add_slack,
             )
         return SolveResult(
             status="infeasible",
@@ -706,8 +889,11 @@ def solve_oa(
     # 2. Solve initial NLP relaxation for first linearization point
     oa_A_rows: list[np.ndarray] = []
     oa_b_rows: list[float] = []
+    oa_slack_flags: list[bool] = []
 
-    x_relax, obj_relax = _solve_nlp_relaxation(evaluator, decomp.lb, decomp.ub, nlp_solver)
+    relax_result = _solve_nlp_relaxation(evaluator, decomp.lb, decomp.ub, nlp_solver)
+    x_relax = relax_result.x
+    obj_relax = relax_result.objective
 
     UB = 1e20
     LB = -1e20
@@ -724,9 +910,13 @@ def solve_oa(
             oa_A_rows,
             oa_b_rows,
             decomp.obj_is_linear,
-            decomp.oa_constraint_mask,
+            constraint_cut_mask,
             decomp.oa_objective_is_convex,
             equality_relaxation=equality_relaxation,
+            add_slack=add_slack,
+            oa_slack_flags=oa_slack_flags,
+            multipliers=relax_result.multipliers,
+            objective_sense=objective_sense,
         )
         # Check if relaxation solution is already integer-feasible
         is_int_feasible = all(
@@ -750,9 +940,12 @@ def solve_oa(
             oa_A_rows,
             oa_b_rows,
             decomp.obj_is_linear,
-            decomp.oa_constraint_mask,
+            constraint_cut_mask,
             decomp.oa_objective_is_convex,
             equality_relaxation=equality_relaxation,
+            add_slack=add_slack,
+            oa_slack_flags=oa_slack_flags,
+            objective_sense=objective_sense,
         )
 
     # 3. Main OA loop
@@ -778,6 +971,9 @@ def solve_oa(
             decomp.master_bound_valid,
             time_limit=time_limit - elapsed,
             gap_tolerance=gap_tolerance,
+            oa_slack_flags=oa_slack_flags,
+            oa_penalty_factor=oa_penalty_factor,
+            max_slack=max_slack,
         )
 
         from discopt.solvers import SolveStatus
@@ -805,16 +1001,19 @@ def solve_oa(
                 oa_A_rows,
                 oa_b_rows,
                 decomp.obj_is_linear,
-                decomp.oa_constraint_mask,
+                constraint_cut_mask,
                 decomp.oa_objective_is_convex,
                 equality_relaxation=equality_relaxation,
+                add_slack=add_slack,
+                oa_slack_flags=oa_slack_flags,
+                objective_sense=objective_sense,
             )
             continue
 
         x_master = master_result.x[:n_vars]
         # The master gives a valid LB only via its dual ``bound`` (never the
         # incumbent ``objective``, which is an upper bound on a limited solve).
-        if decomp.master_bound_valid and master_result.bound is not None:
+        if public_bound_valid and master_result.bound is not None:
             LB = max(LB, master_result.bound)
 
         # b. ECP mode: add cuts at master point, skip NLP
@@ -827,9 +1026,11 @@ def solve_oa(
                 oa_A_rows,
                 oa_b_rows,
                 decomp.obj_is_linear,
-                decomp.oa_constraint_mask,
+                constraint_cut_mask,
                 decomp.oa_objective_is_convex,
                 equality_relaxation=equality_relaxation,
+                add_slack=add_slack,
+                oa_slack_flags=oa_slack_flags,
             )
             # In ECP, use master objective as heuristic UB
             master_obj = float(evaluator.evaluate_objective(x_master))
@@ -856,7 +1057,7 @@ def solve_oa(
             continue
 
         # c. Fix integers, solve NLP subproblem
-        x_nlp, obj_nlp = _solve_nlp_subproblem(
+        nlp_result = _solve_nlp_subproblem(
             evaluator,
             decomp.lb,
             decomp.ub,
@@ -864,8 +1065,10 @@ def solve_oa(
             x_master,
             nlp_solver,
         )
+        x_nlp = nlp_result.x
+        obj_nlp = nlp_result.objective
 
-        if x_nlp is not None:
+        if x_nlp is not None and obj_nlp is not None:
             if obj_nlp < UB:
                 UB = obj_nlp
                 incumbent = x_nlp.copy()
@@ -881,9 +1084,13 @@ def solve_oa(
                 oa_A_rows,
                 oa_b_rows,
                 decomp.obj_is_linear,
-                decomp.oa_constraint_mask,
+                constraint_cut_mask,
                 decomp.oa_objective_is_convex,
                 equality_relaxation=equality_relaxation,
+                add_slack=add_slack,
+                oa_slack_flags=oa_slack_flags,
+                multipliers=nlp_result.multipliers,
+                objective_sense=objective_sense,
             )
         else:
             # NLP infeasible for this integer assignment
@@ -904,11 +1111,14 @@ def solve_oa(
                         decomp.constraint_senses,
                         oa_A_rows,
                         oa_b_rows,
-                        decomp.oa_constraint_mask,
+                        constraint_cut_mask,
+                        oa_slack_flags=oa_slack_flags,
                     )
 
             # Always add no-good cut as fallback to avoid cycling
-            _add_no_good_cut(x_master, decomp.int_indices, oa_A_rows, oa_b_rows, n_vars)
+            _add_no_good_cut(
+                x_master, decomp.int_indices, oa_A_rows, oa_b_rows, n_vars, oa_slack_flags
+            )
 
             # Also add OA cuts at master point
             _add_oa_cuts(
@@ -920,9 +1130,12 @@ def solve_oa(
                 oa_A_rows,
                 oa_b_rows,
                 decomp.obj_is_linear,
-                decomp.oa_constraint_mask,
+                constraint_cut_mask,
                 decomp.oa_objective_is_convex,
                 equality_relaxation=equality_relaxation,
+                add_slack=add_slack,
+                oa_slack_flags=oa_slack_flags,
+                objective_sense=objective_sense,
             )
 
         # d. Check convergence
@@ -942,11 +1155,11 @@ def solve_oa(
     # 4. Build result
     wall_time = time.perf_counter() - t_start
     gap = _compute_gap(LB, UB)
-    bound = LB if decomp.master_bound_valid and LB > -1e19 else None
+    bound = LB if public_bound_valid and LB > -1e19 else None
     reported_gap = gap if bound is not None and UB < 1e19 else None
 
     if incumbent is not None and incumbent_obj is not None:
-        status = "optimal" if gap <= gap_tolerance else "feasible"
+        status = "feasible" if add_slack else ("optimal" if gap <= gap_tolerance else "feasible")
         return SolveResult(
             status=status,
             objective=_obj_sign * incumbent_obj,
@@ -954,13 +1167,15 @@ def solve_oa(
             gap=reported_gap,
             x=_build_x_dict(incumbent, model),
             wall_time=wall_time,
+            gap_certified=not add_slack,
         )
 
     return SolveResult(
-        status="infeasible",
+        status="iteration_limit" if add_slack else "infeasible",
         objective=None,
         bound=(_obj_sign * bound if bound is not None else None),
         gap=None,
         x={},
         wall_time=wall_time,
+        gap_certified=not add_slack,
     )

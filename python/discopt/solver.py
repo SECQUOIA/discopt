@@ -2373,7 +2373,15 @@ def solve_model(
         mip_nlp_method = kwargs.pop("mip_nlp_method", "oa")
         mip_nlp_options = kwargs.pop("mip_nlp_options", None)
         mip_nlp_kwargs: dict[str, Any] = {}
-        for key in ("equality_relaxation", "ecp_mode", "feasibility_cuts"):
+        for key in (
+            "equality_relaxation",
+            "ecp_mode",
+            "feasibility_cuts",
+            "add_slack",
+            "oa_penalty_factor",
+            "max_slack",
+            "heuristic_nonconvex",
+        ):
             if key in kwargs:
                 mip_nlp_kwargs[key] = kwargs.pop(key)
 
@@ -2679,7 +2687,15 @@ def solve_model(
 
         # Extract OA-specific kwargs that solve_model doesn't understand
         mip_nlp_kwargs = {}
-        for key in ("equality_relaxation", "ecp_mode", "feasibility_cuts"):
+        for key in (
+            "equality_relaxation",
+            "ecp_mode",
+            "feasibility_cuts",
+            "add_slack",
+            "oa_penalty_factor",
+            "max_slack",
+            "heuristic_nonconvex",
+        ):
             if key in kwargs:
                 mip_nlp_kwargs[key] = kwargs.pop(key)
 
