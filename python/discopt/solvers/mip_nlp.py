@@ -12,7 +12,17 @@ _METHOD_ALIASES = {
     "lp/nlp-bb": "lp_nlp_bb",
     "lp_nlp_bb": "lp_nlp_bb",
 }
-_OA_OPTION_KEYS = {"equality_relaxation", "ecp_mode", "feasibility_cuts"}
+OA_OPTION_KEYS = frozenset(
+    {
+        "equality_relaxation",
+        "ecp_mode",
+        "feasibility_cuts",
+        "add_slack",
+        "oa_penalty_factor",
+        "max_slack",
+        "heuristic_nonconvex",
+    }
+)
 
 
 def _normalize_method(method: str) -> str:
@@ -43,13 +53,13 @@ def solve_mip_nlp(
     options.update(kwargs)
 
     if method in {"oa", "ecp"}:
-        unexpected = sorted(set(options) - _OA_OPTION_KEYS)
+        unexpected = sorted(set(options) - OA_OPTION_KEYS)
         if unexpected:
             raise ValueError(
                 "Unsupported MIP-NLP OA/ECP option(s): "
                 + ", ".join(unexpected)
                 + ". Supported options are: "
-                + ", ".join(sorted(_OA_OPTION_KEYS))
+                + ", ".join(sorted(OA_OPTION_KEYS))
             )
 
         from discopt.solvers.oa import solve_oa
