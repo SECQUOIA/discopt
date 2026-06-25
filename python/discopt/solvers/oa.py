@@ -245,12 +245,14 @@ def _solve_nlp(evaluator, lb, ub, nlp_solver: str, max_iter: int = 200) -> _OANL
         # Accept iteration-limited results if the solution is primal feasible.
         # The IPM may not certify dual convergence (code 4: stalled) yet still
         # find a valid primal point, which is sufficient for OA linearization cuts.
+        # Do not reuse multipliers from this path: equality-relaxation orientation
+        # should not depend on duals from a solve that did not certify them.
         if result.status == SolveStatus.ITERATION_LIMIT and result.x is not None:
             if _is_primal_feasible(evaluator, result.x):
                 return _OANLPResult(
                     x=result.x,
                     objective=float(evaluator.evaluate_objective(result.x)),
-                    multipliers=result.multipliers,
+                    multipliers=None,
                     primal_feasible=True,
                     status=result.status,
                 )
@@ -798,6 +800,8 @@ def solve_oa(
         Relax nonlinear equalities to inequalities in OA cuts
         (Viswanathan & Grossmann 1990). Helps when nonlinear equalities
         cause the MILP master to become infeasible.
+        Runs that relax nonlinear equality cuts do not report certified public
+        bounds or gaps.
     ecp_mode : bool
         Extended Cutting Plane mode (Westerlund & Pettersson 1995):
         skip NLP subproblems entirely, only add cuts at MILP master

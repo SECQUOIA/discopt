@@ -293,7 +293,8 @@ class TestEqualityRelaxation:
         y=0 → x=0, obj=0
         y=1 → x=1, obj=2
 
-        With ER, the equality is relaxed to x^2 <= y in OA cuts.
+        With ER, the equality receives a dual-oriented single-sided OA cut.
+        Because a nonlinear equality is relaxed, the result is incumbent-only.
         """
         m = dm.Model("er_test")
         x = m.continuous("x", lb=0, ub=2)
@@ -302,10 +303,24 @@ class TestEqualityRelaxation:
         m.subject_to(x**2 - y == 0)
 
         result = _solve_oa(m, equality_relaxation=True)
-        assert result.status in ("optimal", "feasible")
+        assert result.status == "feasible"
         assert result.bound is None
         assert result.gap is None
         assert result.gap_certified is False
+
+    def test_er_without_nonlinear_equality_remains_certified(self):
+        """ER should not taint certified OA when no equality cut is relaxed."""
+        m = dm.Model("er_no_eq_certified")
+        x = m.continuous("x", lb=0, ub=2)
+        y = m.binary("y")
+        m.minimize(x**2 + y)
+        m.subject_to(x + y >= 1)
+
+        result = _solve_oa(m, equality_relaxation=True)
+        assert result.status == "optimal"
+        assert result.bound is not None
+        assert result.gap is not None
+        assert result.gap_certified is True
 
 
 # ── Regression vs B&B ────────────────────────────────────────

@@ -248,6 +248,39 @@ def test_equality_relaxation_orientation_flips_master_cut_row():
     np.testing.assert_allclose(rhs, np.array([-5.0]))
 
 
+def test_iteration_limited_nlp_drops_uncertified_multipliers(monkeypatch):
+    import discopt.solvers.nlp_pounce as nlp_pounce_module
+    import discopt.solvers.oa as oa_module
+    from discopt.solvers import NLPResult
+
+    class FakeEvaluator:
+        def evaluate_objective(self, x):
+            return 3.0
+
+    def fake_solve_nlp(evaluator, x0, options):
+        return NLPResult(
+            status=SolveStatus.ITERATION_LIMIT,
+            x=np.array([1.0]),
+            objective=3.0,
+            multipliers=np.array([9.0]),
+        )
+
+    monkeypatch.setattr(nlp_pounce_module, "solve_nlp", fake_solve_nlp)
+    monkeypatch.setattr(oa_module, "_is_primal_feasible", lambda evaluator, x: True)
+
+    result = oa_module._solve_nlp(
+        FakeEvaluator(),
+        lb=np.array([0.0]),
+        ub=np.array([2.0]),
+        nlp_solver="pounce",
+    )
+
+    assert result.status == SolveStatus.ITERATION_LIMIT
+    assert result.primal_feasible is True
+    assert result.objective == 3.0
+    assert result.multipliers is None
+
+
 def test_heuristic_nonconvex_oa_result_is_uncertified():
     from discopt.solvers.mip_nlp import solve_mip_nlp
 
